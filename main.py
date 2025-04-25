@@ -224,177 +224,135 @@ class ArticleStorage:
         url_index = self._load_json("metadata/url_index.json")
         print(json.dumps(url_index, indent=2, ensure_ascii=False))
 
-class FeedMonitor:
+class FeedManager:
     def __init__(self, storage):
         self.storage = storage
         self.feeds_file = Path("feeds.json")
-        self.feeds = self._load_feeds()
-        self.running = False
-        self.executor = ThreadPoolExecutor(max_workers=4)
         
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            filename='feed_monitor.log'
-        )
-        self.logger = logging.getLogger(__name__)
-
-    def _load_feeds(self):
-        """Load saved RSS feeds from file"""
-        try:
-            if self.feeds_file.exists():
-                with open(self.feeds_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            return {}
-        except Exception as e:
-            self.logger.error(f"Error loading feeds: {e}")
-            return {}
-
-    def _save_feeds(self):
-        """Save RSS feeds to file"""
-        try:
-            with open(self.feeds_file, 'w', encoding='utf-8') as f:
-                json.dump(self.feeds, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving feeds: {e}")
-
     def add_feed(self, url, interval=5):
-        """Add a new feed with proper error handling"""
+        """Add a new feed with validation and duplicate checking"""
         try:
-            # First validate the feed URL
+            # Check if feed already exists
+            feeds = self.list_feeds()
+            if url in feeds:
+                print(f"\nFeed already exists with interval {feeds[url]['interval']} minutes")
+                update = input("Do you want to update the interval? (y/n): ").lower()
+                if update != 'y':
+                    return False
+            
+            # Validate and get feed info
+            print("Checking feed URL...")
             feed = feedparser.parse(url)
             if feed.get('bozo', 1) == 1:
                 raise ValueError("Invalid RSS feed URL")
             
-            # Load existing feeds
-            feeds = {}
-            if self.feeds_file.exists():
-                try:
-                    with open(self.feeds_file, 'r', encoding='utf-8') as f:
-                        feeds = json.load(f)
-                except json.JSONDecodeError:
-                    # If JSON file is corrupted, start fresh
-                    feeds = {}
+            # Get feed details
+            feed_title = feed.feed.get('title', 'Unknown')
+            feed_desc = feed.feed.get('description', '')
+            print(f"\nFeed found: {feed_title}")
             
-            # Add new feed
+            # Create feed entry
             feeds[url] = {
                 'last_check': str(datetime.now() - timedelta(minutes=interval)),
                 'interval': interval,
-                'title': feed.feed.get('title', 'Unknown'),
-                'description': feed.feed.get('description', '')
+                'title': feed_title,
+                'description': feed_desc,
+                'added_date': str(datetime.now()),
+                'active': True
             }
             
-            # Save feeds with proper encoding
-            self._save_feeds()
-            
+            # Save feeds
+            self._save_feeds(feeds)
             return True
-        
+            
         except Exception as e:
-            self.logger.error(f"Error adding feed: {str(e)}")
+            print(f"\nError adding feed: {str(e)}")
             return False
 
-    def remove_feed(self, feed_url):
-        """Remove a feed from monitoring"""
-        if feed_url in self.feeds:
-            del self.feeds[feed_url]
-            self._save_feeds()
-            self.logger.info(f"Removed feed: {feed_url}")
+    def _save_feeds(self, feeds):
+        """Save feeds with backup"""
+        # Create backup if file exists
+        if self.feeds_file.exists():
+            backup_file = self.feeds_file.with_suffix('.json.bak')
+            self.feeds_file.rename(backup_file)
+        
+        try:
+            with open(self.feeds_file, 'w', encoding='utf-8') as f:
+                json.dump(feeds, f, indent=2, ensure_ascii=False)
+                f.write('\n')
+            
+            # Remove backup if save successful
+            if Path(str(self.feeds_file) + '.bak').exists():
+                Path(str(self.feeds_file) + '.bak').unlink()
+                
+        except Exception as e:
+            # Restore from backup if save failed
+            if Path(str(self.feeds_file) + '.bak').exists():
+                Path(str(self.feeds_file) + '.bak').rename(self.feeds_file)
+            raise e
+
+    def list_feeds(self):
+        """List feeds with status information"""
+        try:
+            if not self.feeds_file.exists():
+                return {}
+                
+            with open(self.feeds_file, 'r', encoding='utf-8') as f:
+                feeds = json.load(f)
+                
+            # Add status check
+            for url, info in feeds.items():
+                try:
+                    last_check = datetime.fromisoformat(info['last_check'])
+                    status = "Active" if info.get('active', True) else "Paused"
+                    if datetime.now() - last_check > timedelta(minutes=info['interval'] * 2):
+                        status = "Delayed"
+                    info['status'] = status
+                except Exception:
+                    info['status'] = "Error"
+                    
+            return feeds
+        except Exception as e:
+            print(f"Error reading feeds: {e}")
+            return {}
+
+    def toggle_feed(self, url):
+        """Toggle feed active status"""
+        feeds = self.list_feeds()
+        if url in feeds:
+            feeds[url]['active'] = not feeds[url].get('active', True)
+            self._save_feeds(feeds)
             return True
         return False
 
-    def check_feed(self, feed_url):
-        """Check a single feed for new articles"""
-        try:
-            feed = feedparser.parse(feed_url)
-            last_check = datetime.fromisoformat(self.feeds[feed_url]['last_check'])
-            current_time = datetime.now()
-            
-            new_articles = []
-            for entry in feed.entries:
-                # Get article publish time
-                if hasattr(entry, 'published_parsed'):
-                    pub_date = datetime(*entry.published_parsed[:6])
-                else:
-                    pub_date = current_time  # Use current time if no publish date
-
-                # If article is newer than last check, process it
-                if pub_date > last_check:
-                    if hasattr(entry, 'link'):
-                        new_articles.append(entry.link)
-
-            # Update last check time
-            self.feeds[feed_url]['last_check'] = str(current_time)
-            self._save_feeds()
-
-            # Process new articles
-            for url in new_articles:
-                try:
-                    self.storage.store_article(url)
-                    self.logger.info(f"Processed new article: {url}")
-                except Exception as e:
-                    self.logger.error(f"Error processing article {url}: {e}")
-
-        except Exception as e:
-            self.logger.error(f"Error checking feed {feed_url}: {e}")
-
-    def start_monitoring(self):
-        """Start the monitoring process"""
-        self.running = True
-        
-        def run_pending():
-            while self.running:
-                current_time = datetime.now()
-                
-                # Check each feed
-                for feed_url, feed_info in self.feeds.items():
-                    try:
-                        last_check = datetime.fromisoformat(feed_info['last_check'])
-                        if current_time - last_check >= timedelta(minutes=feed_info['interval']):
-                            self.check_feed(feed_url)
-                    except Exception as e:
-                        self.logger.error(f"Error in feed check loop: {e}")
-                
-                time.sleep(60)  # Wait 1 minute before next check
-        
-        self.executor.submit(run_pending)
-        self.logger.info("Feed monitoring started")
-
-    def stop_monitoring(self):
-        """Stop the monitoring process"""
-        self.running = False
-        self.executor.shutdown(wait=True)
-        self.logger.info("Feed monitoring stopped")
-
-    def list_feeds(self):
-        """Return list of monitored feeds"""
-        return [
-            {
-                'url': url,
-                'title': info['title'],
-                'description': info['description'],
-                'interval': info['interval'],
-                'last_check': info['last_check']
-            }
-            for url, info in self.feeds.items()
-        ]
+    def remove_feed(self, url):
+        """Remove a feed"""
+        feeds = self.list_feeds()
+        if url in feeds:
+            del feeds[url]
+            self._save_feeds(feeds)
+            return True
+        return False
 
 if __name__ == "__main__":
     storage = ArticleStorage("articles")
+    feed_manager = FeedManager(storage)
     
     print("News Article Processing System")
     print("-----------------------------")
-    print("Note: RSS monitoring is handled by background service")
     
     while True:
         print("\nOptions:")
         print("1. Add new article from URL")
         print("2. Search articles")
-        print("3. Add RSS feed to monitor")
+        print("3. Add RSS feed")
         print("4. List monitored feeds")
         print("5. Remove RSS feed")
-        print("6. Exit")
+        print("6. Toggle feed status")
+        print("7. Show feed statistics")
+        print("8. Exit")
         
-        choice = input("Enter your choice (1-6): ")
+        choice = input("\nEnter your choice (1-8): ")
 
         if choice == '1':
             url = input("\nEnter article URL: ").strip()
@@ -431,7 +389,7 @@ if __name__ == "__main__":
             url = input("\nEnter RSS feed URL: ").strip()
             try:
                 interval = int(input("Enter check interval in minutes (default: 5): ") or 5)
-                if add_feed(url, interval):
+                if feed_manager.add_feed(url, interval):
                     print(f"\nSuccessfully added feed: {url}")
                 else:
                     print("\nFailed to add feed")
@@ -439,42 +397,36 @@ if __name__ == "__main__":
                 print(f"\nInvalid input: {e}")
 
         elif choice == '4':
-            feeds = {}
-            if Path("feeds.json").exists():
-                with open("feeds.json", 'r') as f:
-                    feeds = json.load(f)
-            
+            feeds = feed_manager.list_feeds()
             if not feeds:
                 print("\nNo feeds currently monitored")
             else:
                 print("\nCurrently monitored feeds:")
-                for feed_url, feed_info in feeds.items():
-                    print(f"\nTitle: {feed_info['title']}")
-                    print(f"URL: {feed_url}")
-                    print(f"Check interval: {feed_info['interval']} minutes")
-                    print(f"Last checked: {feed_info['last_check']}")
-                    print(f"Description: {feed_info['description']}")
-                    print("-" * 40)
+                for url, info in feeds.items():
+                    print(f"\nTitle: {info['title']}")
+                    print(f"URL: {url}")
+                    print(f"Status: {info['status']}")
+                    print(f"Interval: {info['interval']} minutes")
+                    print(f"Last check: {info['last_check']}")
+                    if info.get('description'):
+                        print(f"Description: {info['description'][:100]}...")
+                    print("-" * 60)
 
         elif choice == '5':
-            feeds = {}
-            if Path("feeds.json").exists():
-                with open("feeds.json", 'r') as f:
-                    feeds = json.load(f)
-            
+            feeds = feed_manager.list_feeds()
             if not feeds:
                 print("\nNo feeds to remove")
                 continue
                 
             print("\nCurrent feeds:")
-            for i, feed_url in enumerate(feeds.keys(), 1):
-                print(f"{i}. {feed_url}")
+            for i, (url, info) in enumerate(feeds.items(), 1):
+                print(f"{i}. {info['title']}")
             
             try:
                 idx = int(input("\nEnter feed number to remove: ")) - 1
                 if 0 <= idx < len(feeds):
                     url = list(feeds.keys())[idx]
-                    if storage.remove_feed(url):
+                    if feed_manager.remove_feed(url):
                         print(f"\nRemoved feed: {url}")
                     else:
                         print("\nFailed to remove feed")
@@ -484,6 +436,46 @@ if __name__ == "__main__":
                 print("\nInvalid input")
 
         elif choice == '6':
+            feeds = feed_manager.list_feeds()
+            if not feeds:
+                print("\nNo feeds to toggle")
+                continue
+                
+            print("\nCurrent feeds:")
+            for i, (url, info) in enumerate(feeds.items(), 1):
+                print(f"{i}. {info['title']}")
+            
+            try:
+                idx = int(input("\nEnter feed number to toggle: ")) - 1
+                if 0 <= idx < len(feeds):
+                    url = list(feeds.keys())[idx]
+                    if feed_manager.toggle_feed(url):
+                        print(f"\nToggled feed: {url}")
+                    else:
+                        print("\nFailed to toggle feed")
+                else:
+                    print("\nInvalid feed number")
+            except ValueError:
+                print("\nInvalid input")
+
+        elif choice == '7':
+            feeds = feed_manager.list_feeds()
+            if not feeds:
+                print("\nNo feeds to show statistics")
+                continue
+                
+            print("\nCurrently monitored feeds:")
+            for url, info in feeds.items():
+                print(f"\nTitle: {info['title']}")
+                print(f"URL: {url}")
+                print(f"Status: {info['status']}")
+                print(f"Interval: {info['interval']} minutes")
+                print(f"Last check: {info['last_check']}")
+                if info.get('description'):
+                    print(f"Description: {info['description'][:100]}...")
+                print("-" * 60)
+
+        elif choice == '8':
             print("\nStopping monitoring and exiting system...")
             break
             

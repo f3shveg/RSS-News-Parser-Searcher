@@ -13,13 +13,14 @@ import traceback
 from main import ArticleStorage
 
 class RSSMonitorDaemon:
-    def __init__(self):
+    def __init__(self, storage=None):
         # Set up logging first
         self._setup_logging()
         
         try:
             self.logger.info("Initializing RSS Monitor Daemon...")
-            self.storage = ArticleStorage("articles")
+            # Use provided storage or create new one
+            self.storage = storage if storage else ArticleStorage("articles")
             self.feeds_file = Path("feeds.json")
             self.running = True
             self.logger.info("Initialization complete")
@@ -72,6 +73,7 @@ class RSSMonitorDaemon:
                 
             last_check = datetime.fromisoformat(feed_info['last_check'])
             current_time = datetime.now()
+            comparison_time = current_time - timedelta(hours=24)
             
             new_articles_count = 0
             for entry in feed.entries:
@@ -81,19 +83,18 @@ class RSSMonitorDaemon:
                     else:
                         pub_date = current_time
 
-                    if pub_date > last_check and hasattr(entry, 'link'):
-                        self.storage.store_article(entry.link)
-                        new_articles_count += 1
+                    if pub_date >= comparison_time and hasattr(entry, 'link'):
+                        if self.storage.store_article(entry.link):
+                            new_articles_count += 1
+                            self.logger.info(f"Stored article: {entry.get('title', 'No title')}")
                 except Exception as e:
-                    self.logger.error(f"Error processing entry in {feed_url}: {str(e)}")
-                    self.logger.error(traceback.format_exc())
+                    self.logger.error(f"Error processing entry: {str(e)}")
 
             self.logger.info(f"Processed {new_articles_count} new articles from {feed_url}")
             return str(current_time)
             
         except Exception as e:
             self.logger.error(f"Error checking feed {feed_url}: {str(e)}")
-            self.logger.error(traceback.format_exc())
             return feed_info['last_check']
 
     def run(self):
@@ -138,7 +139,11 @@ class RSSMonitorDaemon:
 
 def main():
     try:
-        daemon = RSSMonitorDaemon()
+        # Create storage instance that will be shared
+        storage = ArticleStorage("articles")
+        
+        # Pass the storage instance to the daemon
+        daemon = RSSMonitorDaemon(storage)
         
         # Set up signal handlers
         signal.signal(signal.SIGTERM, daemon.handle_signal)

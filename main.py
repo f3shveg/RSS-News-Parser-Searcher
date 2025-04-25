@@ -68,13 +68,20 @@ class ArticleStorage:
                 print(f"Article already exists: {url}")
                 return False
 
+            print(f"Downloading article from: {url}")  # Debug logging
+            
             # Download and parse article
             article = Article(url)
             article.download()
             article.parse()
 
+            if not article.text:
+                print(f"No content found for article: {url}")
+                return False
+
             # Generate unique filename
             filename = self._generate_filename(url)
+            print(f"Generated filename: {filename}")  # Debug logging
             
             # Store article content
             content_path = self.base_dir / "content" / f"{filename}.txt"
@@ -84,6 +91,8 @@ class ArticleStorage:
                 f.write(f"Published: {article.publish_date}\n")
                 f.write("\n" + "="*50 + "\n\n")
                 f.write(article.text)
+
+            print(f"Stored article content in: {content_path}")  # Debug logging
 
             # Store metadata
             metadata = {
@@ -96,6 +105,7 @@ class ArticleStorage:
             }
 
             # Process entities and actions
+            print("Processing article text with NLP...")  # Debug logging
             doc = nlp(article.text)
             for ent in doc.ents:
                 if ent.label_ in ["LOC", "PER", "ORG"]:
@@ -112,12 +122,16 @@ class ArticleStorage:
                         })
 
             # Update indices
+            print("Updating indices...")  # Debug logging
             self._update_indices(filename, url, metadata)
+            print(f"Successfully processed article: {url}")  # Debug logging
             
             return True
 
         except Exception as e:
             print(f"Error processing {url}: {str(e)}")
+            import traceback
+            print(traceback.format_exc())  # Print full error traceback
             return False
 
     def _update_indices(self, filename, url, metadata):

@@ -17,13 +17,17 @@ import json
 from pathlib import Path
 import hashlib
 
-nlp = spacy.load("ru_core_news_lg")
+nlp_ru = spacy.load("ru_core_news_lg")
+nlp_en = spacy.load("en_core_web_lg")
 
 class ArticleStorage:
     def __init__(self, base_dir="articles"):
         """Initialize storage with base directory for articles"""
         self.base_dir = Path(base_dir)
         self._create_directory_structure()
+        # Load both language models
+        self.nlp_ru = nlp_ru
+        self.nlp_en = nlp_en
         
     def _create_directory_structure(self):
         """Create necessary directories if they don't exist"""
@@ -59,6 +63,18 @@ class ArticleStorage:
         except FileNotFoundError:
             return {}
 
+    def _detect_language(self, text):
+        """Detect if text is primarily English or Russian"""
+        # Simple detection based on character sets
+        ru_chars = set('абвгдеёжзийклмнопрстуфхцчшщъыьэюя')
+        en_chars = set('abcdefghijklmnopqrstuvwxyz')
+        
+        text = text.lower()
+        ru_count = sum(1 for c in text if c in ru_chars)
+        en_count = sum(1 for c in text if c in en_chars)
+        
+        return 'ru' if ru_count > en_count else 'en'
+
     def store_article(self, url):
         """Download and store article from URL"""
         try:
@@ -79,6 +95,10 @@ class ArticleStorage:
                 print(f"No content found for article: {url}")
                 return False
 
+            # Detect language and use appropriate model
+            lang = self._detect_language(article.text)
+            nlp = self.nlp_ru if lang == 'ru' else self.nlp_en
+            
             # Generate unique filename
             filename = self._generate_filename(url)
             print(f"Generated filename: {filename}")  # Debug logging
@@ -94,32 +114,81 @@ class ArticleStorage:
 
             print(f"Stored article content in: {content_path}")  # Debug logging
 
-            # Store metadata
+            # Store metadata with language information
             metadata = {
                 'title': article.title,
                 'publish_date': str(article.publish_date),
                 'url': url,
                 'filename': f"{filename}.txt",
+                'language': lang,
                 'entities': {},
                 'actions': []
             }
 
             # Process entities and actions
-            print("Processing article text with NLP...")  # Debug logging
             doc = nlp(article.text)
-            for ent in doc.ents:
-                if ent.label_ in ["LOC", "PER", "ORG"]:
-                    normalized = self._normalize_entity(ent.text, ent.label_)
-                    metadata['entities'][normalized] = ent.label_
+            
+            # Entity mapping for different languages
+            entity_types = {
+                'ru': {'PER', 'LOC', 'ORG'},
+                'en': {'PERSON', 'GPE', 'LOC', 'ORG'}
+            }
+            
+            # Map English entity types to our standard
+            entity_map = {
+                'PERSON': 'PER',
+                'GPE': 'LOC',
+                'LOC': 'LOC',
+                'ORG': 'ORG'
+            }
 
-            # Store actions for persons
+            # Process entities
             for ent in doc.ents:
-                if ent.label_ == "PER":
-                    if ent.root.dep_ in ('nsubj', 'nsubjpass') and ent.root.head.pos_ == 'VERB':
-                        metadata['actions'].append({
-                            'person': self._normalize_entity(ent.text, 'PER'),
-                            'verb': ent.root.head.lemma_.lower()
-                        })
+                ent_type = ent.label_
+                if lang == 'en':
+                    ent_type = entity_map.get(ent_type)
+                
+                if ent_type in entity_types[lang]:
+                    normalized = self._normalize_entity(ent.text, ent_type, lang)
+                    metadata['entities'][normalized] = ent_type
+
+            # Process actions with language-specific patterns
+            for ent in doc.ents:
+                if (lang == 'ru' and ent.label_ == 'PER') or \
+                   (lang == 'en' and ent.label_ == 'PERSON'):
+                    if ent.root.dep_ in ('nsubj', 'nsubjpass'):
+                        verb = ent.root.head
+                        
+                        action = {
+                            'person': self._normalize_entity(ent.text, 'PER', lang),
+                            'verb': verb.lemma_.lower(),
+                            'sentence': '',
+                            'objects': [],
+                            'time': [],
+                            'location': []
+                        }
+
+                        # Get the main clause
+                        clause = []
+                        for token in verb.subtree:
+                            # Collect objects
+                            if token.dep_ in ('dobj', 'pobj', 'iobj'):
+                                action['objects'].append(token.text)
+                            
+                            # Collect time expressions
+                            if token.dep_ == 'npadvmod' and \
+                               any(t.label_ in ['DATE', 'TIME'] for t in token.ents):
+                                action['time'].append(token.text)
+                            
+                            # Collect location
+                            if (lang == 'ru' and token.ent_type_ == 'LOC') or \
+                               (lang == 'en' and token.ent_type_ in ['GPE', 'LOC']):
+                                action['location'].append(token.text)
+                            
+                            clause.append(token.text)
+
+                        action['sentence'] = ' '.join(clause)
+                        metadata['actions'].append(action)
 
             # Update indices
             print("Updating indices...")  # Debug logging
@@ -156,16 +225,24 @@ class ArticleStorage:
         # Save article metadata
         self._save_json(metadata, f"metadata/{base_filename}.json")
 
-    def _normalize_entity(self, text, entity_type):
-        """Normalize entity names"""
+    def _normalize_entity(self, text, entity_type, lang):
+        """Normalize entity names based on language"""
+        nlp = self.nlp_ru if lang == 'ru' else self.nlp_en
         doc = nlp(text.lower())
         
         if entity_type == "LOC":
-            location_map = {
-                r"\bмоскв[а-я]*\b": "москва",
-                r"\b(mosk|msk|mosc)\w*\b": "москва",
-                r"\bмск\b": "москва"
-            }
+            if lang == 'ru':
+                location_map = {
+                    r"\bмоскв[а-я]*\b": "москва",
+                    r"\b(mosk|msk|mosc)\w*\b": "москва",
+                    r"\bмск\b": "москва"
+                }
+            else:
+                location_map = {
+                    r"\bmoscow\b": "moscow",
+                    r"\bny\b": "new york",
+                    r"\bnyc\b": "new york city"
+                }
             
             text = " ".join([token.lemma_ for token in doc])
             for pattern, base in location_map.items():
@@ -184,7 +261,7 @@ class ArticleStorage:
         results = []
 
         try:
-            normalized_term = self._normalize_entity(search_term, entity_type)
+            normalized_term = self._normalize_entity(search_term, entity_type, 'ru')
             print(f"Searching for normalized term: {normalized_term}")  # Debug output
             
             if normalized_term in entity_index:
